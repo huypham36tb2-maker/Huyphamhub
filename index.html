@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Huy Pham Hub</title>
+
+  <!-- Open Graph / Facebook, Zalo, Messenger -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Huy Pham Hub">
+  <meta property="og:title" content="Huy Pham Hub - Script Roblox">
+  <meta property="og:description" content="Chia sẻ script Roblox tại Huy Pham Hub.">
+  <meta property="og:image" content="https://cdn.phototourl.com/free/2026-09-22-f8c1d3ff-3a2f-4693-b1fb-a574d5aee526.jpg">
+  <meta property="og:url" content="">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Huy Pham Hub - Script Roblox">
+  <meta name="twitter:description" content="Chia sẻ script Roblox tại Huy Pham Hub.">
+  <meta name="twitter:image" content="https://cdn.phototourl.com/free/2026-09-22-f8c1d3ff-3a2f-4693-b1fb-a574d5aee526.jpg">
+
+  <style>
+    :root {
+      --bg: #0b0b10;
+      --panel: #14141c;
+      --panel-2: #1b1b26;
+      --border: #262635;
+      --text: #f2f2f7;
+      --muted: #9494a6;
+      --accent: #7c5cff;
+      --accent-2: #29d3a2;
+      padding-top: env(safe-area-inset-top, 0px);
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: radial-gradient(1200px 600px at 50% -10%, #201a3a 0%, var(--bg) 60%);
+      color: var(--text);
+      min-height: 100%;
+      display: flex;
+      justify-content: center;
+      padding: 32px 16px;
+    }
+    .wrap { width: 100%; max-width: 560px; }
+
+    .banner {
+      position: relative;
+      border-radius: 20px;
+      overflow: hidden;
+      margin-bottom: -48px;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+    }
+    .banner img {
+      width: 100%;
+      display: block;
+      aspect-ratio: 16 / 7;
+      object-fit: cover;
+      filter: brightness(0.85);
+    }
+    .banner::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(0,0,0,0) 40%, var(--panel) 100%);
+    }
+
+    .card {
+      position: relative;
+      z-index: 1;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 56px 24px 24px;
+      text-align: center;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(124,92,255,0.12);
+      color: var(--accent);
+      border: 1px solid rgba(124,92,255,0.35);
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+      margin-bottom: 14px;
+    }
+    .badge .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--accent-2);
+      box-shadow: 0 0 8px var(--accent-2);
+    }
+
+    h1 {
+      font-size: 26px;
+      font-weight: 800;
+      letter-spacing: -0.3px;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 14px;
+      margin-top: 6px;
+      margin-bottom: 22px;
+    }
+
+    .stats {
+      display: flex;
+      justify-content: center;
+      gap: 28px;
+      margin-bottom: 22px;
+    }
+    .stat { text-align: center; }
+    .stat b { display: block; font-size: 17px; }
+    .stat span { font-size: 12px; color: var(--muted); }
+
+    .script-box {
+      background: #0e0e15;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      text-align: left;
+      overflow: hidden;
+      margin-bottom: 18px;
+    }
+    .script-box-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel-2);
+    }
+    .script-box-head span {
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    pre {
+      margin: 0;
+      padding: 16px;
+      overflow-x: auto;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      color: #c9c9e0;
+      max-height: 220px;
+    }
+    pre .kw { color: #ff79c6; }
+    pre .str { color: var(--accent-2); }
+    pre .com { color: #6d6d80; }
+
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 14px 20px;
+      border: none;
+      border-radius: 12px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.15s ease, opacity 0.15s ease;
+    }
+    .btn:active { transform: scale(0.98); }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), #5b3fe0);
+      color: #fff;
+      margin-bottom: 10px;
+    }
+    .btn-primary.copied { background: var(--accent-2); }
+    .btn-secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    footer {
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 18px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="banner">
+      <img src="https://cdn.phototourl.com/free/2026-09-22-f8c1d3ff-3a2f-4693-b1fb-a574d5aee526.jpg" alt="Huy Pham Hub">
+    </div>
+
+    <div class="card">
+      <div class="badge"><span class="dot"></span> ĐANG HOẠT ĐỘNG</div>
+      <h1>Huy Pham Hub</h1>
+      <p class="subtitle">Script Roblox — dán ID game hoặc tên script vào đây</p>
+
+      <div class="stats">
+        <div class="stat"><b id="statUsers">0</b><span>Người dùng</span></div>
+        <div class="stat"><b>100%</b><span>Undetected</span></div>
+        <div class="stat"><b>Free</b><span>Miễn phí</span></div>
+      </div>
+
+      <div class="script-box">
+        <div class="script-box-head">
+          <span>script.lua</span>
+          <span id="lineCount">-- dòng</span>
+        </div>
+        <pre id="scriptText"><span class="com">-- Dán script Roblox của bạn vào đây</span>
+<span class="kw">loadstring</span>(<span class="str">game:HttpGet("https://raw.githubusercontent.com/user/repo/main/script.lua")</span>)()</pre>
+      </div>
+
+      <button class="btn btn-primary" id="copyBtn">Copy Script</button>
+      <button class="btn btn-secondary" id="discordBtn">Tham gia Discord</button>
+
+      <footer>© 2026 Huy Pham Hub. Sử dụng script tự chịu trách nhiệm.</footer>
+    </div>
+  </div>
+
+  <script>
+    // Đếm số dòng script tự động
+    const scriptEl = document.getElementById('scriptText');
+    const lines = scriptEl.innerText.trim().split('\n').length;
+    document.getElementById('lineCount').textContent = lines + ' dòng';
+
+    // Số người dùng giả lập tăng dần (chỉ hiệu ứng UI, không lưu trạng thái thật)
+    let count = 128300;
+    const statUsers = document.getElementById('statUsers');
+    function formatNum(n) { return n.toLocaleString('vi-VN'); }
+    statUsers.textContent = formatNum(count);
+    setInterval(() => {
+      count += Math.floor(Math.random() * 3);
+      statUsers.textContent = formatNum(count);
+    }, 4000);
+
+    // Copy script
+    const copyBtn = document.getElementById('copyBtn');
+    copyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(scriptEl.innerText.trim());
+        copyBtn.textContent = 'Đã copy!';
+        copyBtn.classList.add('copied');
+        setTimeout(() => {
+          copyBtn.textContent = 'Copy Script';
+          copyBtn.classList.remove('copied');
+        }, 1800);
+      } catch (e) {
+        copyBtn.textContent = 'Không copy được, thử thủ công';
+      }
+    });
+
+    // Nút Discord — thay link thật vào đây
+    document.getElementById('discordBtn').addEventListener('click', () => {
+      window.open('https://discord.gg/your-invite', '_blank');
+    });
+  </script>
+</body>
+</html>
