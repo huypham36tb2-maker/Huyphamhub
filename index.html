@@ -1,689 +1,9 @@
-/* ============================================================
-   🚀 LuaShare 3D - All-in-One Server
-   Node.js + Express + SQLite + Passport + Three.js Frontend
-   ============================================================ */
-
-require('dotenv').config();
-const express = require('express');
-const session = require('express-session');
-const SQLiteStore = require('connect-sqlite3')(session);
-const passport = require('passport');
-const GoogleStrategy = require('passport-google-oauth20').Strategy;
-const LocalStrategy = require('passport-local').Strategy;
-const bcrypt = require('bcryptjs');
-const path = require('path');
-const fs = require('fs');
-const multer = require('multer');
-const axios = require('axios');
-const Database = require('better-sqlite3');
-
-// ============================================================
-// DATABASE SETUP
-// ============================================================
-const db = new Database(path.join(__dirname, 'luashare.db'));
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password TEXT,
-    google_id TEXT UNIQUE,
-    email TEXT,
-    phone TEXT,
-    phone_verified INTEGER DEFAULT 0,
-    display_name TEXT,
-    avatar TEXT,
-    role TEXT DEFAULT 'user',
-    plan TEXT DEFAULT 'free',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS scripts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    description TEXT,
-    code TEXT NOT NULL,
-    category TEXT DEFAULT 'General',
-    author_id INTEGER,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (author_id) REFERENCES users(id)
-  );
-  CREATE TABLE IF NOT EXISTS purchases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    plan TEXT,
-    price INTEGER,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS chat_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    role TEXT,
-    message TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
-
-// Seed admin
-if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get('huypham')) {
-  db.prepare(`INSERT INTO users (username, password, display_name, role, plan, phone_verified, email)
-    VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run('huypham', bcrypt.hashSync('huypham', 10), 'Huy Phạm', 'admin', 'premium', 1, 'admin@luashare.com');
-  console.log('✅ Admin mặc định: huypham / huypham');
-}
-
-// Seed scripts
-if (db.prepare('SELECT COUNT(*) as c FROM scripts').get().c === 0) {
-  const adminId = db.prepare('SELECT id FROM users WHERE username = ?').get('huypham').id;
-  const ins = db.prepare(`INSERT INTO scripts (title, description, code, category, author_id) VALUES (?, ?, ?, ?, ?)`);
-  ins.run('Auto Farm Lua', 'Script tự động farm cho game',
-    `-- Auto Farm Script\nwhile true do\n  print("Farming...")\n  wait(1)\nend`, 'Automation', adminId);
-  ins.run('ESP Player', 'Hiển thị vị trí người chơi qua tường',
-    `-- ESP Script\nfor _, p in pairs(game.Players:GetPlayers()) do\n  print(p.Name)\nend`, 'Visual', adminId);
-  ins.run('Speed Hack', 'Tăng tốc độ di chuyển',
-    `-- Speed Hack\nlocal speed = 100\ngame.Players.LocalPlayer.Character.Humanoid.WalkSpeed = speed`, 'Movement', adminId);
-  console.log('✅ Đã seed script mẫu');
-}
-
-// ============================================================
-// EXPRESS APP
-// ============================================================
-const app = express();
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use(session({
-  store: new SQLiteStore({ db: 'sessions.db', dir: './' }),
-  secret: process.env.SESSION_SECRET || 'luashare_secret',
-  resave: false,
-  saveUninitialized: false,
-  cookie: { maxAge: 1000 * 60 * 60 * 24 * 7 }
-}));
-app.use(passport.initialize());
-app.use(passport.session());
-
-// Uploads
-const avatarDir = path.join(__dirname, 'uploads', 'avatars');
-fs.mkdirSync(avatarDir, { recursive: true });
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: (r, f, cb) => cb(null, avatarDir),
-    filename: (r, f, cb) => cb(null, `user_${r.session.userId}_${Date.now()}${path.extname(f.originalname)}`)
-  }),
-  limits: { fileSize: 2 * 1024 * 1024 },
-  fileFilter: (r, f, cb) => f.mimetype.startsWith('image/') ? cb(null, true) : cb(new Error('Chỉ cho phép ảnh'))
-});
-
-// ============================================================
-// PASSPORT
-// ============================================================
-passport.serializeUser((u, done) => done(null, u.id));
-passport.deserializeUser((id, done) => done(null, db.prepare('SELECT * FROM users WHERE id = ?').get(id) || false));
-
-passport.use(new LocalStrategy(async (username, password, done) => {
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-  if (!user) return done(null, false, { message: 'Sai tên đăng nhập' });
-  if (!user.password) return done(null, false, { message: 'Dùng Google Login' });
-  if (!(await bcrypt.compare(password, user.password))) return done(null, false, { message: 'Sai mật khẩu' });
-  return done(null, user);
-}));
-
-if (process.env.GOOGLE_CLIENT_ID && !process.env.GOOGLE_CLIENT_ID.includes('your_google')) {
-  passport.use(new GoogleStrategy({
-    clientID: process.env.GOOGLE_CLIENT_ID,
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-    callbackURL: process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3000/auth/google/callback'
-  }, (at, rt, profile, done) => {
-    try {
-      let user = db.prepare('SELECT * FROM users WHERE google_id = ?').get(profile.id);
-      if (!user) {
-        const email = profile.emails?.[0]?.value || '';
-        user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-        if (user) {
-          db.prepare('UPDATE users SET google_id = ? WHERE id = ?').run(profile.id, user.id);
-          user = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
-        } else {
-          const info = db.prepare(`INSERT INTO users (google_id, email, display_name, avatar) VALUES (?, ?, ?, ?)`)
-            .run(profile.id, email, profile.displayName, profile.photos?.[0]?.value);
-          user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
-        }
-      }
-      done(null, user);
-    } catch (e) { done(e); }
-  }));
-}
-
-// ============================================================
-// MIDDLEWARE
-// ============================================================
-const requireAuth = (req, res, next) => req.session.userId ? next() : res.status(401).json({ error: 'Chưa đăng nhập' });
-const requireAdmin = (req, res, next) => req.session.role === 'admin' ? next() : res.status(403).json({ error: 'Không có quyền' });
-
-// ============================================================
-// AUTH ROUTES
-// ============================================================
-app.post('/auth/register', async (req, res) => {
-  try {
-    const { username, password, phone } = req.body;
-    if (!username || !password) return res.status(400).json({ error: 'Thiếu thông tin' });
-    if (password.length < 4) return res.status(400).json({ error: 'Mật khẩu >= 4 ký tự' });
-    if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username))
-      return res.status(400).json({ error: 'Tên đăng nhập đã tồn tại' });
-
-    const info = db.prepare(`INSERT INTO users (username, password, display_name, phone, phone_verified)
-      VALUES (?, ?, ?, ?, ?)`)
-      .run(username, bcrypt.hashSync(password, 10), username, phone || null, phone ? 1 : 0);
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
-    req.session.userId = user.id;
-    req.session.role = user.role;
-    res.json({ success: true, user: safeUser(user) });
-  } catch (e) { res.status(500).json({ error: 'Lỗi server' }); }
-});
-
-app.post('/auth/login', (req, res, next) => {
-  passport.authenticate('local', (err, user, info) => {
-    if (err || !user) return res.status(401).json({ error: info?.message || 'Đăng nhập thất bại' });
-    req.logIn(user, (err) => {
-      if (err) return res.status(500).json({ error: 'Lỗi đăng nhập' });
-      req.session.userId = user.id;
-      req.session.role = user.role;
-      res.json({ success: true, user: safeUser(user) });
-    });
-  })(req, res, next);
-});
-
-app.post('/auth/logout', (req, res) => {
-  req.logout(() => req.session.destroy(() => res.json({ success: true })));
-});
-
-app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
-app.get('/auth/google/callback',
-  passport.authenticate('google', { failureRedirect: '/?error=google_failed' }),
-  (req, res) => {
-    req.session.userId = req.user.id;
-    req.session.role = req.user.role;
-    res.redirect('/dashboard');
-  }
-);
-
-// ============================================================
-// USER ROUTES
-// ============================================================
-app.get('/api/me', (req, res) => {
-  if (!req.session.userId) return res.json({ user: null });
-  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.session.userId);
-  res.json({ user: safeUser(u) });
-});
-
-app.get('/api/user/profile', requireAuth, (req, res) => {
-  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.session.userId);
-  res.json({ user: safeUser(u) });
-});
-
-app.put('/api/user/profile', requireAuth, (req, res) => {
-  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.session.userId);
-  const { email, display_name, phone } = req.body;
-  let phoneVerified = u.phone_verified;
-  if (phone && phone !== u.phone) phoneVerified = 0;
-  db.prepare(`UPDATE users SET email = ?, display_name = ?, phone = ?, phone_verified = ? WHERE id = ?`)
-    .run(email ?? u.email, display_name ?? u.display_name, phone ?? u.phone, phoneVerified, req.session.userId);
-  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(req.session.userId);
-  res.json({ success: true, user: safeUser(updated) });
-});
-
-app.post('/api/user/avatar', requireAuth, upload.single('avatar'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'Chưa chọn file' });
-  const url = `/uploads/avatars/${req.file.filename}`;
-  db.prepare('UPDATE users SET avatar = ? WHERE id = ?').run(url, req.session.userId);
-  res.json({ success: true, avatar: url });
-});
-
-// OTP in-memory
-const otpStore = new Map();
-app.post('/api/user/phone/send-otp', requireAuth, (req, res) => {
-  const { phone } = req.body;
-  if (!phone || !/^[0-9+\-\s]{8,15}$/.test(phone)) return res.status(400).json({ error: 'SĐT không hợp lệ' });
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
-  otpStore.set(req.session.userId, { phone, otp, expires: Date.now() + 5 * 60 * 1000 });
-  console.log(`📱 OTP cho user ${req.session.userId}: ${otp} (SĐT: ${phone})`);
-  res.json({ success: true, dev_otp: otp });
-});
-
-app.post('/api/user/phone/verify', requireAuth, (req, res) => {
-  const { otp } = req.body;
-  const rec = otpStore.get(req.session.userId);
-  if (!rec) return res.status(400).json({ error: 'Chưa yêu cầu OTP' });
-  if (Date.now() > rec.expires) { otpStore.delete(req.session.userId); return res.status(400).json({ error: 'OTP hết hạn' }); }
-  if (rec.otp !== otp) return res.status(400).json({ error: 'OTP sai' });
-  db.prepare('UPDATE users SET phone = ?, phone_verified = 1 WHERE id = ?').run(rec.phone, req.session.userId);
-  otpStore.delete(req.session.userId);
-  res.json({ success: true });
-});
-
-// ============================================================
-// SCRIPT ROUTES
-// ============================================================
-app.get('/api/scripts', (req, res) => {
-  const scripts = db.prepare(`
-    SELECT s.*, u.username as author_name, u.display_name as author_display, u.avatar as author_avatar
-    FROM scripts s LEFT JOIN users u ON s.author_id = u.id
-    ORDER BY s.created_at DESC
-  `).all();
-  res.json({ scripts });
-});
-
-app.get('/api/scripts/:id', (req, res) => {
-  const s = db.prepare(`
-    SELECT s.*, u.username as author_name, u.display_name as author_display
-    FROM scripts s LEFT JOIN users u ON s.author_id = u.id WHERE s.id = ?
-  `).get(req.params.id);
-  if (!s) return res.status(404).json({ error: 'Không tìm thấy' });
-  res.json({ script: s });
-});
-
-app.post('/api/scripts', requireAdmin, async (req, res) => {
-  const { title, description, code, category } = req.body;
-  if (!title || !code) return res.status(400).json({ error: 'Thiếu tiêu đề hoặc code' });
-  const info = db.prepare(`INSERT INTO scripts (title, description, code, category, author_id) VALUES (?, ?, ?, ?, ?)`)
-    .run(title, description || '', code, category || 'General', req.session.userId);
-  const script = db.prepare('SELECT * FROM scripts WHERE id = ?').get(info.lastInsertRowid);
-  await sendDiscordWebhook({
-    title: '📢 Script mới!',
-    description: `**${title}**\n${description || 'Không có mô tả'}\nDanh mục: \`${category || 'General'}\``,
-    color: 0x8b5cf6
-  });
-  res.json({ success: true, script });
-});
-
-app.put('/api/scripts/:id', requireAdmin, async (req, res) => {
-  const ex = db.prepare('SELECT * FROM scripts WHERE id = ?').get(req.params.id);
-  if (!ex) return res.status(404).json({ error: 'Không tìm thấy' });
-  const { title, description, code, category } = req.body;
-  db.prepare(`UPDATE scripts SET title = ?, description = ?, code = ?, category = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
-    .run(title || ex.title, description ?? ex.description, code || ex.code, category || ex.category, req.params.id);
-  const script = db.prepare('SELECT * FROM scripts WHERE id = ?').get(req.params.id);
-  await sendDiscordWebhook({
-    title: '🔄 Script được cập nhật!',
-    description: `**${script.title}** vừa được cập nhật.`,
-    color: 0x6366f1
-  });
-  res.json({ success: true, script });
-});
-
-app.delete('/api/scripts/:id', requireAdmin, (req, res) => {
-  if (!db.prepare('SELECT 1 FROM scripts WHERE id = ?').get(req.params.id))
-    return res.status(404).json({ error: 'Không tìm thấy' });
-  db.prepare('DELETE FROM scripts WHERE id = ?').run(req.params.id);
-  res.json({ success: true });
-});
-
-// ============================================================
-// SHOP ROUTES
-// ============================================================
-const PLANS = {
-  free: { name: 'Free', price: 0, features: ['Truy cập script cơ bản', 'Chat AI giới hạn'] },
-  pro: { name: 'Pro', price: 99000, features: ['Tất cả script Pro', 'Chat AI không giới hạn', 'Hỗ trợ ưu tiên'] },
-  premium: { name: 'Premium', price: 199000, features: ['Tất cả script Premium', 'Chat AI VIP', 'Hỗ trợ 24/7', 'Yêu cầu script riêng'] }
-};
-
-app.get('/api/shop/plans', (req, res) => res.json({ plans: PLANS }));
-
-app.post('/api/shop/buy', requireAuth, (req, res) => {
-  const { plan } = req.body;
-  if (!PLANS[plan] || plan === 'free') return res.status(400).json({ error: 'Gói không hợp lệ' });
-  db.prepare('UPDATE users SET plan = ? WHERE id = ?').run(plan, req.session.userId);
-  db.prepare('INSERT INTO purchases (user_id, plan, price) VALUES (?, ?, ?)').run(req.session.userId, plan, PLANS[plan].price);
-  res.json({ success: true, plan });
-});
-
-// ============================================================
-// AI CHAT
-// ============================================================
-app.post('/api/ai/chat', requireAuth, async (req, res) => {
-  try {
-    const { message } = req.body;
-    if (!message) return res.status(400).json({ error: 'Thiếu tin nhắn' });
-    db.prepare('INSERT INTO chat_history (user_id, role, message) VALUES (?, ?, ?)').run(req.session.userId, 'user', message);
-
-    let reply;
-    if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.startsWith('sk-')) {
-      try {
-        const r = await axios.post('https://api.openai.com/v1/chat/completions', {
-          model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: 'Bạn là trợ lý AI của LuaShare - nền tảng chia sẻ code Lua. Trả lời thân thiện, chuyên nghiệp, hỗ trợ về Lua, Roblox, scripting.' },
-            { role: 'user', content: message }
-          ],
-          temperature: 0.8,
-          max_tokens: 500
-        }, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
-        reply = r.data.choices[0].message.content;
-      } catch (e) {
-        console.error('OpenAI error:', e.message);
-        reply = fallbackReply(message);
-      }
-    } else {
-      reply = fallbackReply(message);
-    }
-
-    db.prepare('INSERT INTO chat_history (user_id, role, message) VALUES (?, ?, ?)').run(req.session.userId, 'assistant', reply);
-    res.json({ reply });
-  } catch (e) { res.status(500).json({ error: 'Lỗi AI' }); }
-});
-
-app.get('/api/ai/history', requireAuth, (req, res) => {
-  const h = db.prepare('SELECT * FROM chat_history WHERE user_id = ? ORDER BY created_at ASC LIMIT 100').all(req.session.userId);
-  res.json({ history: h });
-});
-
-function fallbackReply(msg) {
-  const m = msg.toLowerCase();
-  if (m.includes('lua') || m.includes('script'))
-    return `📚 Về Lua Script:\n\nLua là ngôn ngữ scripting nhẹ, phổ biến trong game (Roblox, FiveM).\n\nVí dụ:\n\`\`\`lua\nlocal x = 10\nif x > 5 then\n  print("Lớn hơn 5")\nend\n\`\`\``;
-  if (m.includes('chào') || m.includes('hello') || m.includes('hi'))
-    return '👋 Xin chào! Tôi là trợ lý AI của LuaShare. Hỏi tôi về Lua, script, gói Pro/Premium nhé!';
-  if (m.includes('pro') || m.includes('premium') || m.includes('mua'))
-    return '💎 Gói nâng cấp:\n- **Pro** (99.000đ): script Pro, AI không giới hạn\n- **Premium** (199.000đ): tất cả + hỗ trợ 24/7\n\nVào tab Shop nhé!';
-  if (m.includes('roblox'))
-    return '🎮 Roblox dùng Luau (Lua). Bạn có thể tạo game, script, UI trên Roblox Studio!';
-  if (m.includes('discord'))
-    return '💬 Vào server Discord qua tab "Discord Server" ở sidebar nhé!';
-  return `💡 Bạn hỏi: "${msg}"\n\nĐây là AI demo. Thêm \`OPENAI_API_KEY\` vào .env để AI thông minh hơn!`;
-}
-
-// ============================================================
-// DISCORD WEBHOOK
-// ============================================================
-async function sendDiscordWebhook({ title, description, color = 0x8b5cf6 }) {
-  const url = process.env.DISCORD_WEBHOOK_URL;
-  if (!url || url.includes('YOUR_WEBHOOK')) return;
-  try {
-    await axios.post(url, {
-      embeds: [{ title, description, color, timestamp: new Date().toISOString(), footer: { text: 'LuaShare' } }]
-    });
-  } catch (e) { console.error('Webhook error:', e.message); }
-}
-
-function safeUser(u) {
-  return {
-    id: u.id, username: u.username, email: u.email,
-    phone: u.phone, phone_verified: !!u.phone_verified,
-    display_name: u.display_name, avatar: u.avatar, role: u.role, plan: u.plan
-  };
-}
-
-// ============================================================
-// PAGE ROUTES
-// ============================================================
-app.get('/', (req, res) => {
-  if (req.session.userId) return res.redirect('/dashboard');
-  res.send(LOGIN_PAGE);
-});
-
-app.get('/dashboard', (req, res) => {
-  if (!req.session.userId) return res.redirect('/');
-  res.send(DASHBOARD_PAGE);
-});
-
-// ============================================================
-// INLINE HTML - LOGIN PAGE
-// ============================================================
-const LOGIN_PAGE = `<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LuaShare 3D - Đăng nhập</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-<style>
-*{font-family:'Inter',sans-serif;}
-body{background:#0a0a1a;color:#e5e7eb;overflow:hidden;margin:0;}
-#bg-canvas{position:fixed;inset:0;z-index:0;}
-.glass{background:rgba(20,20,40,0.7);backdrop-filter:blur(24px);border:1px solid rgba(139,92,246,0.25);box-shadow:0 8px 32px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.05);}
-.neon-text{background:linear-gradient(135deg,#8b5cf6,#ec4899,#06b6d4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;filter:drop-shadow(0 0 30px rgba(139,92,246,0.6));}
-.input-3d{background:rgba(10,10,25,0.6);border:1px solid rgba(139,92,246,0.25);color:#e5e7eb;transition:all .3s;}
-.input-3d:focus{outline:none;border-color:#8b5cf6;box-shadow:0 0 0 3px rgba(139,92,246,0.15),0 0 25px rgba(139,92,246,0.4);background:rgba(10,10,25,0.9);}
-.input-3d::placeholder{color:rgba(156,163,175,0.5);}
-.neon-btn{position:relative;background:linear-gradient(135deg,#6366f1,#8b5cf6);transition:all .3s;overflow:hidden;z-index:1;}
-.neon-btn::before{content:'';position:absolute;inset:-2px;background:linear-gradient(135deg,#8b5cf6,#ec4899,#06b6d4,#8b5cf6);background-size:300% 300%;border-radius:inherit;z-index:-1;animation:gs 3s linear infinite;filter:blur(10px);opacity:0;transition:opacity .3s;}
-.neon-btn:hover::before{opacity:1;}
-.neon-btn:hover{transform:translateY(-2px);box-shadow:0 15px 50px rgba(139,92,246,0.6);}
-@keyframes gs{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
-@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-12px)}}
-.float-anim{animation:float 6s ease-in-out infinite;}
-.tab-active{background:linear-gradient(135deg,rgba(139,92,246,0.3),rgba(236,72,153,0.2));color:#fff;}
-#hero-canvas{width:100%;height:180px;display:block;}
-</style>
-</head>
-<body class="flex items-center justify-center p-4 min-h-screen">
-
-<canvas id="bg-canvas"></canvas>
-
-<div class="relative z-10 w-full max-w-md">
-  <div class="glass rounded-3xl p-8 float-anim">
-    <canvas id="hero-canvas"></canvas>
-    <div class="text-center -mt-4 mb-6">
-      <h1 class="text-4xl font-extrabold neon-text mb-1">LuaShare</h1>
-      <p class="text-gray-400 text-sm">Nền tảng chia sẻ code Lua 3D</p>
-    </div>
-
-    <div class="flex mb-6 bg-black/30 rounded-xl p-1 border border-violet-500/20">
-      <button id="tabLogin" class="flex-1 py-2.5 rounded-lg font-medium tab-active transition">Đăng nhập</button>
-      <button id="tabRegister" class="flex-1 py-2.5 rounded-lg font-medium text-gray-400 transition">Đăng ký</button>
-    </div>
-
-    <form id="loginForm" class="space-y-4">
-      <input type="text" id="loginUsername" placeholder="Tên đăng nhập" required class="input-3d w-full px-4 py-3 rounded-xl">
-      <input type="password" id="loginPassword" placeholder="Mật khẩu" required class="input-3d w-full px-4 py-3 rounded-xl">
-      <button type="submit" class="neon-btn w-full text-white py-3 rounded-xl font-semibold">Đăng nhập</button>
-    </form>
-
-    <form id="registerForm" class="space-y-4 hidden">
-      <input type="text" id="regUsername" placeholder="Tên đăng nhập" required class="input-3d w-full px-4 py-3 rounded-xl">
-      <input type="password" id="regPassword" placeholder="Mật khẩu (>=4 ký tự)" required minlength="4" class="input-3d w-full px-4 py-3 rounded-xl">
-      <input type="tel" id="regPhone" placeholder="Số điện thoại" required class="input-3d w-full px-4 py-3 rounded-xl">
-      <button type="submit" class="neon-btn w-full text-white py-3 rounded-xl font-semibold">Đăng ký</button>
-    </form>
-
-    <div class="my-6 flex items-center gap-3">
-      <div class="flex-1 h-px bg-gradient-to-r from-transparent via-violet-500/40 to-transparent"></div>
-      <span class="text-xs text-gray-500">HOẶC</span>
-      <div class="flex-1 h-px bg-gradient-to-r from-transparent via-violet-500/40 to-transparent"></div>
-    </div>
-
-    <a href="/auth/google" class="flex items-center justify-center gap-3 w-full border border-violet-500/30 py-3 rounded-xl font-medium hover:bg-violet-500/10 transition text-white">
-      <svg class="w-5 h-5" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
-      Đăng nhập bằng Google
-    </a>
-
-    <p id="errorMsg" class="mt-4 text-red-400 text-sm text-center hidden"></p>
-    <p class="mt-6 text-xs text-gray-500 text-center">Admin mặc định: <b class="text-violet-400">huypham</b> / <b class="text-violet-400">huypham</b></p>
-  </div>
-</div>
-
-<script>
-// ===== 3D BACKGROUND =====
-(function(){
-  const canvas = document.getElementById('bg-canvas');
-  const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 1000);
-  camera.position.z = 50;
-  const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
-  renderer.setSize(innerWidth, innerHeight);
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-
-  const starsCount = 2000;
-  const positions = new Float32Array(starsCount*3);
-  const colors = new Float32Array(starsCount*3);
-  const palette = [new THREE.Color('#8b5cf6'), new THREE.Color('#ec4899'), new THREE.Color('#06b6d4'), new THREE.Color('#6366f1')];
-  for(let i=0;i<starsCount;i++){
-    positions[i*3]=(Math.random()-0.5)*300;
-    positions[i*3+1]=(Math.random()-0.5)*300;
-    positions[i*3+2]=(Math.random()-0.5)*300;
-    const c = palette[Math.floor(Math.random()*palette.length)];
-    colors[i*3]=c.r; colors[i*3+1]=c.g; colors[i*3+2]=c.b;
-  }
-  const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(positions,3));
-  geom.setAttribute('color', new THREE.BufferAttribute(colors,3));
-  const mat = new THREE.PointsMaterial({size:0.5, vertexColors:true, transparent:true, opacity:0.85, blending:THREE.AdditiveBlending, depthWrite:false});
-  const stars = new THREE.Points(geom, mat);
-  scene.add(stars);
-
-  // Floating wireframe shapes
-  const g = new THREE.Group();
-  const s1 = new THREE.Mesh(new THREE.IcosahedronGeometry(15,1), new THREE.MeshBasicMaterial({color:'#8b5cf6', wireframe:true, transparent:true, opacity:0.15}));
-  s1.position.set(-22, 8, -25);
-  const s2 = new THREE.Mesh(new THREE.OctahedronGeometry(12,1), new THREE.MeshBasicMaterial({color:'#ec4899', wireframe:true, transparent:true, opacity:0.13}));
-  s2.position.set(25, -10, -20);
-  const s3 = new THREE.Mesh(new THREE.TetrahedronGeometry(10), new THREE.MeshBasicMaterial({color:'#06b6d4', wireframe:true, transparent:true, opacity:0.12}));
-  s3.position.set(0, -18, -35);
-  g.add(s1,s2,s3);
-  scene.add(g);
-
-  let mx=0,my=0,tx=0,ty=0;
-  document.addEventListener('mousemove', e=>{ mx=(e.clientX/innerWidth)*2-1; my=-(e.clientY/innerHeight)*2+1; });
-  const clock = new THREE.Clock();
-  function animate(){
-    requestAnimationFrame(animate);
-    const t = clock.getElapsedTime();
-    stars.rotation.y = t*0.02;
-    stars.rotation.x = t*0.01;
-    g.rotation.y = t*0.08;
-    s1.rotation.x = t*0.15; s1.rotation.y = t*0.1;
-    s2.rotation.x = -t*0.12; s2.rotation.z = t*0.08;
-    s3.rotation.y = t*0.2; s3.rotation.x = t*0.05;
-    tx += (mx-tx)*0.05; ty += (my-ty)*0.05;
-    camera.position.x = tx*3;
-    camera.position.y = ty*3;
-    renderer.render(scene, camera);
-  }
-  animate();
-  addEventListener('resize', ()=>{
-    camera.aspect = innerWidth/innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(innerWidth, innerHeight);
-  });
-})();
-
-// ===== 3D HERO LOGO =====
-(function(){
-  const canvas = document.getElementById('hero-canvas');
-  const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(50, canvas.clientWidth/canvas.clientHeight, 0.1, 100);
-  camera.position.z = 4;
-
-  const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
-  renderer.setSize(canvas.clientWidth, canvas.clientHeight);
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-
-  // Center icosahedron
-  const geo = new THREE.IcosahedronGeometry(1.2, 1);
-  const mat = new THREE.MeshBasicMaterial({color:'#8b5cf6', wireframe:true, transparent:true, opacity:0.9});
-  const mesh = new THREE.Mesh(geo, mat);
-  scene.add(mesh);
-
-  // Inner glow sphere
-  const innerMat = new THREE.MeshBasicMaterial({color:'#ec4899', transparent:true, opacity:0.15});
-  const inner = new THREE.Mesh(new THREE.IcosahedronGeometry(0.85, 2), innerMat);
-  scene.add(inner);
-
-  // Orbiting small cubes
-  const orbits = new THREE.Group();
-  for(let i=0;i<6;i++){
-    const angle = (i/6)*Math.PI*2;
-    const c = new THREE.Mesh(
-      new THREE.BoxGeometry(0.15,0.15,0.15),
-      new THREE.MeshBasicMaterial({color: i%2 ? '#ec4899' : '#06b6d4'})
-    );
-    c.position.set(Math.cos(angle)*2, Math.sin(angle)*2, 0);
-    orbits.add(c);
-  }
-  scene.add(orbits);
-
-  const clock = new THREE.Clock();
-  function animate(){
-    requestAnimationFrame(animate);
-    const t = clock.getElapsedTime();
-    mesh.rotation.x = t*0.5;
-    mesh.rotation.y = t*0.7;
-    inner.rotation.x = -t*0.3;
-    inner.rotation.y = -t*0.4;
-    orbits.rotation.z = t*0.8;
-    orbits.rotation.x = Math.sin(t*0.5)*0.3;
-    renderer.render(scene, camera);
-  }
-  animate();
-})();
-
-// ===== FORM LOGIC =====
-const tabLogin = document.getElementById('tabLogin');
-const tabRegister = document.getElementById('tabRegister');
-const loginForm = document.getElementById('loginForm');
-const registerForm = document.getElementById('registerForm');
-const errorMsg = document.getElementById('errorMsg');
-
-function showTab(tab){
-  if(tab==='login'){
-    loginForm.classList.remove('hidden'); registerForm.classList.add('hidden');
-    tabLogin.classList.add('tab-active'); tabLogin.classList.remove('text-gray-400');
-    tabRegister.classList.remove('tab-active'); tabRegister.classList.add('text-gray-400');
-  } else {
-    registerForm.classList.remove('hidden'); loginForm.classList.add('hidden');
-    tabRegister.classList.add('tab-active'); tabRegister.classList.remove('text-gray-400');
-    tabLogin.classList.remove('tab-active'); tabLogin.classList.add('text-gray-400');
-  }
-  errorMsg.classList.add('hidden');
-}
-tabLogin.onclick = ()=>showTab('login');
-tabRegister.onclick = ()=>showTab('register');
-
-function showError(msg){ errorMsg.textContent = msg; errorMsg.classList.remove('hidden'); }
-
-loginForm.onsubmit = async e=>{
-  e.preventDefault();
-  const r = await fetch('/auth/login',{
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      username: document.getElementById('loginUsername').value,
-      password: document.getElementById('loginPassword').value
-    })
-  });
-  const d = await r.json();
-  if(d.success) location.href='/dashboard';
-  else showError(d.error||'Lỗi');
-};
-
-registerForm.onsubmit = async e=>{
-  e.preventDefault();
-  const r = await fetch('/auth/register',{
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      username: document.getElementById('regUsername').value,
-      password: document.getElementById('regPassword').value,
-      phone: document.getElementById('regPhone').value
-    })
-  });
-  const d = await r.json();
-  if(d.success) location.href='/dashboard';
-  else showError(d.error||'Lỗi');
-};
-</script>
-</body>
-</html>`;
-
-// ============================================================
-// INLINE HTML - DASHBOARD PAGE
-// ============================================================
-const DASHBOARD_PAGE = `<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LuaShare 3D - Dashboard</title>
+<title>LuaShare 3D</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
@@ -692,85 +12,139 @@ const DASHBOARD_PAGE = `<!DOCTYPE html>
 body{background:#0a0a1a;color:#e5e7eb;margin:0;overflow-x:hidden;}
 #bg-canvas{position:fixed;inset:0;z-index:0;pointer-events:none;}
 
-.glass{background:rgba(20,20,40,0.65);backdrop-filter:blur(20px);border:1px solid rgba(139,92,246,0.2);box-shadow:0 8px 32px rgba(0,0,0,0.4);}
-.glass-hover:hover{background:rgba(30,30,60,0.75);border-color:rgba(139,92,246,0.5);box-shadow:0 8px 40px rgba(139,92,246,0.35);transform:translateY(-4px);}
-.neon-text{background:linear-gradient(135deg,#8b5cf6,#ec4899,#06b6d4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;}
-
-.card-3d{perspective:1200px;}
-.card-3d-inner{transition:transform .3s cubic-bezier(.25,.46,.45,.94);transform-style:preserve-3d;position:relative;}
-.card-3d-inner::before{content:'';position:absolute;inset:0;border-radius:inherit;background:radial-gradient(600px circle at var(--mx,50%) var(--my,50%), rgba(139,92,246,0.2), transparent 40%);opacity:0;transition:opacity .3s;pointer-events:none;}
-.card-3d:hover .card-3d-inner::before{opacity:1;}
-
-.sidebar-3d{background:linear-gradient(180deg,rgba(12,12,28,0.98),rgba(18,12,35,0.98));backdrop-filter:blur(24px);border-right:1px solid rgba(139,92,246,0.18);box-shadow:4px 0 30px rgba(0,0,0,0.5);}
-.sidebar-link{position:relative;transition:all .3s cubic-bezier(.4,0,.2,1);}
-.sidebar-link::before{content:'';position:absolute;left:0;top:50%;transform:translateY(-50%) scaleY(0);width:3px;height:60%;background:linear-gradient(180deg,#8b5cf6,#ec4899);border-radius:0 4px 4px 0;transition:transform .3s;}
-.sidebar-link:hover{background:rgba(139,92,246,0.1);transform:translateX(4px);}
-.sidebar-link.active{background:linear-gradient(90deg,rgba(139,92,246,0.3),rgba(236,72,153,0.1));color:#fff;}
-.sidebar-link.active::before{transform:translateY(-50%) scaleY(1);}
+.glass{background:rgba(20,20,40,0.65);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(139,92,246,0.2);box-shadow:0 8px 32px rgba(0,0,0,0.4);}
+.glass-hover:hover{background:rgba(30,30,60,0.75);border-color:rgba(139,92,246,0.5);box-shadow:0 8px 40px rgba(139,92,246,0.35);}
+.neon-text{background:linear-gradient(135deg,#8b5cf6,#ec4899,#06b6d4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;filter:drop-shadow(0 0 20px rgba(139,92,246,0.5));}
 
 .input-3d{background:rgba(10,10,25,0.6);border:1px solid rgba(139,92,246,0.25);color:#e5e7eb;transition:all .3s;}
 .input-3d:focus{outline:none;border-color:#8b5cf6;box-shadow:0 0 0 3px rgba(139,92,246,0.15),0 0 20px rgba(139,92,246,0.35);}
 .input-3d::placeholder{color:rgba(156,163,175,0.5);}
 
-.neon-btn{position:relative;background:linear-gradient(135deg,#6366f1,#8b5cf6);transition:all .3s;overflow:hidden;z-index:1;}
+.neon-btn{position:relative;background:linear-gradient(135deg,#6366f1,#8b5cf6);transition:all .3s;overflow:hidden;z-index:1;cursor:pointer;}
 .neon-btn::before{content:'';position:absolute;inset:-2px;background:linear-gradient(135deg,#8b5cf6,#ec4899,#06b6d4,#8b5cf6);background-size:300% 300%;border-radius:inherit;z-index:-1;animation:gs 3s linear infinite;filter:blur(10px);opacity:0;transition:opacity .3s;}
 .neon-btn:hover::before{opacity:1;}
 .neon-btn:hover{transform:translateY(-2px);box-shadow:0 15px 50px rgba(139,92,246,0.6);}
 @keyframes gs{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
 
-.plan-card{transition:all .4s;position:relative;overflow:hidden;transform-style:preserve-3d;}
-.plan-card:hover{transform:translateY(-8px) rotateX(2deg);box-shadow:0 20px 60px rgba(139,92,246,0.4);}
+.sidebar-3d{background:linear-gradient(180deg,rgba(12,12,28,0.98),rgba(18,12,35,0.98));backdrop-filter:blur(24px);border-right:1px solid rgba(139,92,246,0.18);box-shadow:4px 0 30px rgba(0,0,0,0.5);}
+.sidebar-link{position:relative;transition:all .3s cubic-bezier(.4,0,.2,1);cursor:pointer;}
+.sidebar-link::before{content:'';position:absolute;left:0;top:50%;transform:translateY(-50%) scaleY(0);width:3px;height:60%;background:linear-gradient(180deg,#8b5cf6,#ec4899);border-radius:0 4px 4px 0;transition:transform .3s;}
+.sidebar-link:hover{background:rgba(139,92,246,0.1);transform:translateX(4px);}
+.sidebar-link.active{background:linear-gradient(90deg,rgba(139,92,246,0.3),rgba(236,72,153,0.1));color:#fff;}
+.sidebar-link.active::before{transform:translateY(-50%) scaleY(1);}
+
+.plan-card{transition:all .4s;position:relative;overflow:hidden;}
+.plan-card:hover{transform:translateY(-8px);box-shadow:0 20px 60px rgba(139,92,246,0.4);}
 
 @keyframes slideIn{from{transform:translateX(120%);opacity:0}to{transform:translateX(0);opacity:1}}
 #toast{animation:slideIn .3s ease-out;}
-@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
 .float-anim{animation:float 6s ease-in-out infinite;}
+
+.chat-msg{animation:msgIn .3s;}
+@keyframes msgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
 
 pre{tab-size:2;}
 ::-webkit-scrollbar{width:8px;height:8px;}
 ::-webkit-scrollbar-track{background:rgba(20,20,40,0.5);}
 ::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#6366f1,#8b5cf6);border-radius:4px;}
-::-webkit-scrollbar-thumb:hover{background:linear-gradient(180deg,#8b5cf6,#ec4899);}
 
-.chat-msg{animation:msgIn .3s;}
-@keyframes msgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+/* Mobile menu */
+#mobileMenuBtn{display:none;}
+@media(max-width:768px){
+  #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:60;transform:translateX(-100%);transition:transform .3s;}
+  #sidebar.open{transform:translateX(0);}
+  #mobileMenuBtn{display:flex;}
+  #sidebarOverlay{display:none;}
+  #sidebarOverlay.show{display:block;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:55;}
+}
 </style>
 </head>
 <body>
 
 <canvas id="bg-canvas"></canvas>
 
-<div class="flex h-screen overflow-hidden relative z-10">
+<!-- LOGIN VIEW -->
+<div id="loginView" class="relative z-10 flex items-center justify-center min-h-screen p-4">
+  <div class="w-full max-w-md">
+    <div class="glass rounded-3xl p-6 sm:p-8 float-anim">
+      <canvas id="hero-canvas" style="width:100%;height:150px;display:block;"></canvas>
+      <div class="text-center -mt-6 mb-6">
+        <h1 class="text-4xl font-extrabold neon-text mb-1">LuaShare</h1>
+        <p class="text-gray-400 text-sm">Nền tảng chia sẻ code Lua 3D</p>
+      </div>
+
+      <div class="flex mb-6 bg-black/30 rounded-xl p-1 border border-violet-500/20">
+        <button id="tabLogin" class="flex-1 py-2.5 rounded-lg font-medium transition tab-active">Đăng nhập</button>
+        <button id="tabRegister" class="flex-1 py-2.5 rounded-lg font-medium text-gray-400 transition">Đăng ký</button>
+      </div>
+
+      <form id="loginForm" class="space-y-4">
+        <input type="text" id="loginUsername" placeholder="Tên đăng nhập" required class="input-3d w-full px-4 py-3 rounded-xl">
+        <input type="password" id="loginPassword" placeholder="Mật khẩu" required class="input-3d w-full px-4 py-3 rounded-xl">
+        <button type="submit" class="neon-btn w-full text-white py-3 rounded-xl font-semibold">Đăng nhập</button>
+      </form>
+
+      <form id="registerForm" class="space-y-4 hidden">
+        <input type="text" id="regUsername" placeholder="Tên đăng nhập" required class="input-3d w-full px-4 py-3 rounded-xl">
+        <input type="password" id="regPassword" placeholder="Mật khẩu (>=4 ký tự)" required minlength="4" class="input-3d w-full px-4 py-3 rounded-xl">
+        <input type="tel" id="regPhone" placeholder="Số điện thoại" required class="input-3d w-full px-4 py-3 rounded-xl">
+        <button type="submit" class="neon-btn w-full text-white py-3 rounded-xl font-semibold">Đăng ký</button>
+      </form>
+
+      <div class="my-5 flex items-center gap-3">
+        <div class="flex-1 h-px bg-gradient-to-r from-transparent via-violet-500/40 to-transparent"></div>
+        <span class="text-xs text-gray-500">HOẶC</span>
+        <div class="flex-1 h-px bg-gradient-to-r from-transparent via-violet-500/40 to-transparent"></div>
+      </div>
+
+      <button onclick="googleLogin()" class="flex items-center justify-center gap-3 w-full border border-violet-500/30 py-3 rounded-xl font-medium hover:bg-violet-500/10 transition text-white">
+        <svg class="w-5 h-5" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+        Đăng nhập bằng Google (demo)
+      </button>
+
+      <p id="errorMsg" class="mt-4 text-red-400 text-sm text-center hidden"></p>
+      <p class="mt-6 text-xs text-gray-500 text-center">Admin mặc định: <b class="text-violet-400">huypham</b> / <b class="text-violet-400">huypham</b></p>
+    </div>
+  </div>
+</div>
+
+<!-- DASHBOARD VIEW -->
+<div id="dashboardView" class="hidden relative z-10 flex h-screen overflow-hidden">
+  <div id="sidebarOverlay" onclick="closeSidebar()"></div>
 
   <!-- SIDEBAR -->
-  <aside class="sidebar-3d w-64 flex flex-col">
-    <div class="p-5 border-b border-violet-500/20">
-      <h1 class="text-2xl font-extrabold neon-text">LuaShare</h1>
-      <p class="text-[10px] text-violet-400 mt-0.5 tracking-widest">3D EDITION</p>
+  <aside id="sidebar" class="sidebar-3d w-64 flex flex-col">
+    <div class="p-5 border-b border-violet-500/20 flex items-center justify-between">
+      <div>
+        <h1 class="text-2xl font-extrabold neon-text">LuaShare</h1>
+        <p class="text-[10px] text-violet-400 mt-0.5 tracking-widest">3D EDITION</p>
+      </div>
+      <button onclick="closeSidebar()" class="md:hidden text-gray-400 text-2xl">&times;</button>
     </div>
 
     <nav class="flex-1 p-3 space-y-1 overflow-y-auto">
-      <a href="#" data-tab="home" class="sidebar-link active flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300 transition">
+      <a onclick="switchTab('home')" data-tab="home" class="sidebar-link active flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300">
         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
         <span class="font-medium">Trang chủ</span>
       </a>
-      <a href="#" data-tab="shop" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300 transition">
+      <a onclick="switchTab('shop')" data-tab="shop" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300">
         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
         <span class="font-medium">Shop</span>
       </a>
-      <a href="#" data-tab="ai" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300 transition">
+      <a onclick="switchTab('ai')" data-tab="ai" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300">
         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
         <span class="font-medium">AI Chatbot</span>
       </a>
-      <a href="https://discord.gg/your-invite" target="_blank" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300 transition">
-        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M20.317 4.37a19.79 19.79 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.037A19.736 19.736 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028 14.09 14.09 0 001.226-1.994.076.076 0 00-.041-.106 13.107 13.107 0 01-1.872-.892.077.077 0 01-.008-.128 10.2 10.2 0 00.372-.292.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.01c.12.098.246.198.373.292a.077.077 0 01-.006.127 12.299 12.299 0 01-1.873.892.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.839 19.839 0 006.002-3.03.077.077 0 00.032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
+      <a href="https://discord.gg/your-invite" target="_blank" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300">
+        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M20.317 4.37a19.79 19.79 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.037A19.736 19.736 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028 14.09 14.09 0 001.226-1.994.076.076 0 00-.041-.106 13.107 13.107 0 01-1.872-.892.077.077 0 01-.008-.128 10.2 10.2 0 00.372-.292.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.01c.12.098.246.198.373.292a.077.077 0 01-.006.127 12.299 12.299 0 01-1.873.892.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.839 19.839 0 006.002-3.03.077.077 0 00.032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.03z"/></svg>
         <span class="font-medium">Discord Server</span>
       </a>
-      <a href="#" data-tab="settings" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300 transition">
+      <a onclick="switchTab('settings')" data-tab="settings" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300">
         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
         <span class="font-medium">Cài đặt</span>
       </a>
-      <a href="#" data-tab="admin" id="adminLink" class="sidebar-link hidden items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300 transition">
+      <a onclick="switchTab('admin')" data-tab="admin" id="adminLink" class="sidebar-link hidden items-center gap-3 px-4 py-2.5 rounded-lg text-gray-300">
         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/></svg>
         <span class="font-medium">Cập nhật Script</span>
       </a>
@@ -787,7 +161,7 @@ pre{tab-size:2;}
       </button>
 
       <div id="userMenu" class="hidden absolute bottom-20 left-3 right-3 glass rounded-lg p-1 z-50">
-        <button id="logoutBtn" class="w-full text-left px-3 py-2 text-red-400 hover:bg-red-500/20 rounded-md text-sm font-medium flex items-center gap-2">
+        <button onclick="logout()" class="w-full text-left px-3 py-2 text-red-400 hover:bg-red-500/20 rounded-md text-sm font-medium flex items-center gap-2">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
           Đăng xuất
         </button>
@@ -797,13 +171,17 @@ pre{tab-size:2;}
 
   <!-- MAIN -->
   <main class="flex-1 overflow-y-auto">
-    <header class="glass sticky top-0 z-20 px-6 py-4 flex items-center justify-between border-b border-violet-500/20">
-      <h2 id="pageTitle" class="text-xl font-bold text-white">Trang chủ</h2>
+    <header class="glass sticky top-0 z-20 px-4 sm:px-6 py-4 flex items-center justify-between border-b border-violet-500/20">
+      <div class="flex items-center gap-3">
+        <button id="mobileMenuBtn" onclick="openSidebar()" class="text-violet-400 p-1">
+          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>
+        <h2 id="pageTitle" class="text-lg sm:text-xl font-bold text-white">Trang chủ</h2>
+      </div>
       <span id="planBadge" class="px-3 py-1 bg-violet-500/20 text-violet-300 text-xs font-bold rounded-full border border-violet-500/40">FREE</span>
     </header>
 
-    <div class="p-6">
-
+    <div class="p-4 sm:p-6">
       <!-- HOME -->
       <section id="tab-home">
         <div class="mb-6">
@@ -818,7 +196,7 @@ pre{tab-size:2;}
         <div id="plansList" class="grid grid-cols-1 md:grid-cols-3 gap-6"></div>
       </section>
 
-      <!-- AI CHAT -->
+      <!-- AI -->
       <section id="tab-ai" class="hidden">
         <div class="glass rounded-2xl max-w-3xl mx-auto flex flex-col" style="height:70vh;">
           <div class="border-b border-violet-500/20 p-4 flex items-center gap-3">
@@ -847,11 +225,11 @@ pre{tab-size:2;}
             <div>
               <input type="file" id="avatarInput" accept="image/*" class="hidden">
               <button onclick="document.getElementById('avatarInput').click()" class="neon-btn text-white px-4 py-2 rounded-lg text-sm font-medium">Đổi Avatar</button>
-              <p class="text-xs text-gray-500 mt-1">PNG/JPG, tối đa 2MB</p>
+              <p class="text-xs text-gray-500 mt-1">Ảnh sẽ được lưu vào localStorage</p>
             </div>
           </div>
 
-          <form id="settingsForm" class="space-y-4">
+          <div class="space-y-4">
             <div>
               <label class="block text-sm font-medium text-violet-300 mb-1">Tên hiển thị</label>
               <input type="text" id="setDisplayName" class="input-3d w-full px-4 py-2.5 rounded-xl">
@@ -864,19 +242,19 @@ pre{tab-size:2;}
               <label class="block text-sm font-medium text-violet-300 mb-1">Số điện thoại</label>
               <div class="flex gap-2">
                 <input type="tel" id="setPhone" class="input-3d flex-1 px-4 py-2.5 rounded-xl">
-                <button type="button" id="sendOtpBtn" class="bg-green-600 hover:bg-green-500 text-white px-4 py-2.5 rounded-xl font-medium text-sm transition">Gửi OTP</button>
+                <button type="button" onclick="sendOTP()" class="bg-green-600 hover:bg-green-500 text-white px-4 py-2.5 rounded-xl font-medium text-sm transition">Gửi OTP</button>
               </div>
               <p id="phoneStatus" class="text-xs mt-1"></p>
             </div>
             <div id="otpBox" class="hidden">
-              <label class="block text-sm font-medium text-violet-300 mb-1">Nhập OTP</label>
+              <label class="block text-sm font-medium text-violet-300 mb-1">Nhập OTP (demo: 123456)</label>
               <div class="flex gap-2">
                 <input type="text" id="otpInput" maxlength="6" class="input-3d flex-1 px-4 py-2.5 rounded-xl" placeholder="6 số">
-                <button type="button" id="verifyOtpBtn" class="neon-btn text-white px-4 py-2.5 rounded-xl font-medium text-sm">Xác minh</button>
+                <button type="button" onclick="verifyOTP()" class="neon-btn text-white px-4 py-2.5 rounded-xl font-medium text-sm">Xác minh</button>
               </div>
             </div>
-            <button type="submit" class="neon-btn w-full text-white py-3 rounded-xl font-semibold">Lưu thay đổi</button>
-          </form>
+            <button onclick="saveProfile()" class="neon-btn w-full text-white py-3 rounded-xl font-semibold">Lưu thay đổi</button>
+          </div>
         </div>
       </section>
 
@@ -893,7 +271,7 @@ pre{tab-size:2;}
               <textarea id="scriptCode" required rows="8" placeholder="Code Lua..." class="input-3d w-full px-3 py-2 rounded-lg font-mono text-sm"></textarea>
               <div class="flex gap-2">
                 <button type="submit" class="neon-btn flex-1 text-white py-2 rounded-lg font-semibold">Lưu</button>
-                <button type="button" id="resetFormBtn" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition">Hủy</button>
+                <button type="button" onclick="resetScriptForm()" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition">Hủy</button>
               </div>
             </form>
           </div>
@@ -908,7 +286,7 @@ pre{tab-size:2;}
   </main>
 </div>
 
-<!-- MODAL -->
+<!-- MODAL VIEW SCRIPT -->
 <div id="viewModal" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
   <div class="glass rounded-2xl max-w-3xl w-full max-h-[90vh] overflow-hidden flex flex-col">
     <div class="p-4 border-b border-violet-500/20 flex items-center justify-between">
@@ -925,10 +303,13 @@ pre{tab-size:2;}
   </div>
 </div>
 
-<div id="toast" class="hidden fixed top-4 right-4 glass text-white px-4 py-3 rounded-lg z-50"></div>
+<!-- TOAST -->
+<div id="toast" class="hidden fixed top-4 right-4 glass text-white px-4 py-3 rounded-lg z-[100] max-w-[80vw]"></div>
 
 <script>
-// ===== 3D BACKGROUND =====
+// ============================================================
+// 3D BACKGROUND
+// ============================================================
 (function(){
   const canvas = document.getElementById('bg-canvas');
   const scene = new THREE.Scene();
@@ -938,11 +319,11 @@ pre{tab-size:2;}
   renderer.setSize(innerWidth, innerHeight);
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 
-  const starsCount = 1500;
-  const positions = new Float32Array(starsCount*3);
-  const colors = new Float32Array(starsCount*3);
+  const count = innerWidth < 768 ? 800 : 1500;
+  const positions = new Float32Array(count*3);
+  const colors = new Float32Array(count*3);
   const palette = [new THREE.Color('#8b5cf6'), new THREE.Color('#ec4899'), new THREE.Color('#06b6d4'), new THREE.Color('#6366f1')];
-  for(let i=0;i<starsCount;i++){
+  for(let i=0;i<count;i++){
     positions[i*3]=(Math.random()-0.5)*300;
     positions[i*3+1]=(Math.random()-0.5)*300;
     positions[i*3+2]=(Math.random()-0.5)*300;
@@ -952,15 +333,17 @@ pre{tab-size:2;}
   const geom = new THREE.BufferGeometry();
   geom.setAttribute('position', new THREE.BufferAttribute(positions,3));
   geom.setAttribute('color', new THREE.BufferAttribute(colors,3));
-  const stars = new THREE.Points(geom, new THREE.PointsMaterial({size:0.4, vertexColors:true, transparent:true, opacity:0.7, blending:THREE.AdditiveBlending, depthWrite:false}));
+  const stars = new THREE.Points(geom, new THREE.PointsMaterial({size:0.5, vertexColors:true, transparent:true, opacity:0.85, blending:THREE.AdditiveBlending, depthWrite:false}));
   scene.add(stars);
 
   const g = new THREE.Group();
-  const s1 = new THREE.Mesh(new THREE.IcosahedronGeometry(20,1), new THREE.MeshBasicMaterial({color:'#8b5cf6', wireframe:true, transparent:true, opacity:0.08}));
-  s1.position.set(-30, 15, -40);
-  const s2 = new THREE.Mesh(new THREE.OctahedronGeometry(15,1), new THREE.MeshBasicMaterial({color:'#ec4899', wireframe:true, transparent:true, opacity:0.07}));
-  s2.position.set(35, -15, -30);
-  g.add(s1,s2);
+  const s1 = new THREE.Mesh(new THREE.IcosahedronGeometry(20,1), new THREE.MeshBasicMaterial({color:'#8b5cf6', wireframe:true, transparent:true, opacity:0.12}));
+  s1.position.set(-25, 10, -30);
+  const s2 = new THREE.Mesh(new THREE.OctahedronGeometry(15,1), new THREE.MeshBasicMaterial({color:'#ec4899', wireframe:true, transparent:true, opacity:0.1}));
+  s2.position.set(28, -12, -25);
+  const s3 = new THREE.Mesh(new THREE.TetrahedronGeometry(12), new THREE.MeshBasicMaterial({color:'#06b6d4', wireframe:true, transparent:true, opacity:0.08}));
+  s3.position.set(0, -20, -40);
+  g.add(s1,s2,s3);
   scene.add(g);
 
   let mx=0,my=0,tx=0,ty=0;
@@ -969,10 +352,11 @@ pre{tab-size:2;}
   (function animate(){
     requestAnimationFrame(animate);
     const t = clock.getElapsedTime();
-    stars.rotation.y = t*0.015;
-    g.rotation.y = t*0.05;
-    s1.rotation.x = t*0.1;
-    s2.rotation.y = -t*0.15;
+    stars.rotation.y = t*0.02;
+    g.rotation.y = t*0.06;
+    s1.rotation.x = t*0.15;
+    s2.rotation.y = -t*0.12;
+    s3.rotation.x = t*0.1;
     tx += (mx-tx)*0.05; ty += (my-ty)*0.05;
     camera.position.x = tx*2;
     camera.position.y = ty*2;
@@ -985,50 +369,215 @@ pre{tab-size:2;}
   });
 })();
 
-// ===== 3D CARD TILT =====
-function initCard3D(){
-  document.querySelectorAll('.card-3d').forEach(card => {
-    const inner = card.querySelector('.card-3d-inner');
-    if(!inner) return;
-    card.addEventListener('mousemove', e => {
-      const rect = card.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-      const rx = ((y - rect.height/2) / rect.height) * -12;
-      const ry = ((x - rect.width/2) / rect.width) * 12;
-      inner.style.transform = \`rotateX(\${rx}deg) rotateY(\${ry}deg) scale(1.02)\`;
-      inner.style.setProperty('--mx', x + 'px');
-      inner.style.setProperty('--my', y + 'px');
-    });
-    card.addEventListener('mouseleave', () => {
-      inner.style.transform = '';
-    });
-  });
-}
+// ============================================================
+// 3D HERO LOGO
+// ============================================================
+(function(){
+  const canvas = document.getElementById('hero-canvas');
+  if(!canvas) return;
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+  camera.position.z = 4;
+  const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
+  renderer.setSize(320, 150);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 
-// ===== APP =====
+  const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(1.2, 1), new THREE.MeshBasicMaterial({color:'#8b5cf6', wireframe:true, transparent:true, opacity:0.9}));
+  scene.add(mesh);
+  const inner = new THREE.Mesh(new THREE.IcosahedronGeometry(0.85, 2), new THREE.MeshBasicMaterial({color:'#ec4899', transparent:true, opacity:0.15}));
+  scene.add(inner);
+
+  const orbits = new THREE.Group();
+  for(let i=0;i<6;i++){
+    const angle = (i/6)*Math.PI*2;
+    const c = new THREE.Mesh(new THREE.BoxGeometry(0.15,0.15,0.15), new THREE.MeshBasicMaterial({color: i%2 ? '#ec4899' : '#06b6d4'}));
+    c.position.set(Math.cos(angle)*2, Math.sin(angle)*2, 0);
+    orbits.add(c);
+  }
+  scene.add(orbits);
+
+  const clock = new THREE.Clock();
+  (function animate(){
+    requestAnimationFrame(animate);
+    const t = clock.getElapsedTime();
+    mesh.rotation.x = t*0.5;
+    mesh.rotation.y = t*0.7;
+    inner.rotation.x = -t*0.3;
+    orbits.rotation.z = t*0.8;
+    orbits.rotation.x = Math.sin(t*0.5)*0.3;
+    renderer.render(scene, camera);
+  })();
+})();
+
+// ============================================================
+// LOCALSTORAGE DATABASE
+// ============================================================
+const DB = {
+  get(key, def = null){
+    try { const v = localStorage.getItem('luashare_'+key); return v ? JSON.parse(v) : def; }
+    catch { return def; }
+  },
+  set(key, val){ localStorage.setItem('luashare_'+key, JSON.stringify(val)); },
+  remove(key){ localStorage.removeItem('luashare_'+key); }
+};
+
+// Khởi tạo dữ liệu mặc định
+function initDB(){
+  if(!DB.get('users')){
+    DB.set('users', [
+      {
+        id: 1, username: 'huypham', password: 'huypham',
+        display_name: 'Huy Phạm', email: 'admin@luashare.com',
+        phone: '0900000000', phone_verified: true,
+        avatar: null, role: 'admin', plan: 'premium'
+      }
+    ]);
+  }
+  if(!DB.get('scripts')){
+    DB.set('scripts', [
+      {
+        id: 1, title: 'Auto Farm Lua', description: 'Script tự động farm cho game',
+        code: '-- Auto Farm Script\nwhile true do\n  print("Farming...")\n  wait(1)\nend',
+        category: 'Automation', author_id: 1, author_display: 'Huy Phạm',
+        created_at: new Date().toISOString()
+      },
+      {
+        id: 2, title: 'ESP Player', description: 'Hiển thị vị trí người chơi qua tường',
+        code: '-- ESP Script\nfor _, p in pairs(game.Players:GetPlayers()) do\n  print(p.Name)\nend',
+        category: 'Visual', author_id: 1, author_display: 'Huy Phạm',
+        created_at: new Date().toISOString()
+      },
+      {
+        id: 3, title: 'Speed Hack', description: 'Tăng tốc độ di chuyển',
+        code: '-- Speed Hack\nlocal speed = 100\ngame.Players.LocalPlayer.Character.Humanoid.WalkSpeed = speed',
+        category: 'Movement', author_id: 1, author_display: 'Huy Phạm',
+        created_at: new Date().toISOString()
+      }
+    ]);
+  }
+  if(!DB.get('chat')) DB.set('chat', []);
+}
+initDB();
+
+// ============================================================
+// AUTH
+// ============================================================
 let currentUser = null;
-let allScripts = [];
-let chatInitialized = false;
 
-async function init(){
-  const r = await fetch('/api/me');
-  const d = await r.json();
-  if(!d.user){ location.href='/'; return; }
-  currentUser = d.user;
-  updateUserUI();
-  loadScripts();
-  loadPlans();
-  setupNav();
-  setupUserMenu();
-  setupSettings();
-  setupModal();
-  setupSearch();
-  initCard3D();
+function showError(msg){
+  const el = document.getElementById('errorMsg');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  setTimeout(() => el.classList.add('hidden'), 4000);
 }
 
+// Tabs
+document.getElementById('tabLogin').onclick = () => {
+  document.getElementById('loginForm').classList.remove('hidden');
+  document.getElementById('registerForm').classList.add('hidden');
+  document.getElementById('tabLogin').classList.add('tab-active');
+  document.getElementById('tabLogin').classList.remove('text-gray-400');
+  document.getElementById('tabRegister').classList.remove('tab-active');
+  document.getElementById('tabRegister').classList.add('text-gray-400');
+};
+document.getElementById('tabRegister').onclick = () => {
+  document.getElementById('registerForm').classList.remove('hidden');
+  document.getElementById('loginForm').classList.add('hidden');
+  document.getElementById('tabRegister').classList.add('tab-active');
+  document.getElementById('tabRegister').classList.remove('text-gray-400');
+  document.getElementById('tabLogin').classList.remove('tab-active');
+  document.getElementById('tabLogin').classList.add('text-gray-400');
+};
+
+// Login
+document.getElementById('loginForm').onsubmit = e => {
+  e.preventDefault();
+  const u = document.getElementById('loginUsername').value.trim();
+  const p = document.getElementById('loginPassword').value;
+  const users = DB.get('users', []);
+  const user = users.find(x => x.username === u && x.password === p);
+  if(!user){ showError('Sai tên đăng nhập hoặc mật khẩu'); return; }
+  DB.set('currentUserId', user.id);
+  enterDashboard(user);
+};
+
+// Register
+document.getElementById('registerForm').onsubmit = e => {
+  e.preventDefault();
+  const u = document.getElementById('regUsername').value.trim();
+  const p = document.getElementById('regPassword').value;
+  const phone = document.getElementById('regPhone').value.trim();
+  if(p.length < 4){ showError('Mật khẩu >= 4 ký tự'); return; }
+  const users = DB.get('users', []);
+  if(users.find(x => x.username === u)){ showError('Tên đăng nhập đã tồn tại'); return; }
+  const newUser = {
+    id: Date.now(), username: u, password: p,
+    display_name: u, email: '', phone: phone, phone_verified: !!phone,
+    avatar: null, role: 'user', plan: 'free'
+  };
+  users.push(newUser);
+  DB.set('users', users);
+  DB.set('currentUserId', newUser.id);
+  enterDashboard(newUser);
+};
+
+// Google demo
+function googleLogin(){
+  const name = prompt('Nhập tên Google của bạn (demo):', 'Google User');
+  if(!name) return;
+  const email = name.toLowerCase().replace(/\s+/g,'') + '@gmail.com';
+  const users = DB.get('users', []);
+  let user = users.find(x => x.email === email);
+  if(!user){
+    user = {
+      id: Date.now(), username: 'g_' + Date.now(),
+      password: null, display_name: name, email: email,
+      phone: '', phone_verified: false,
+      avatar: null, role: 'user', plan: 'free'
+    };
+    users.push(user);
+    DB.set('users', users);
+  }
+  DB.set('currentUserId', user.id);
+  enterDashboard(user);
+}
+
+// Logout
+function logout(){
+  DB.remove('currentUserId');
+  currentUser = null;
+  location.reload();
+}
+
+// Enter dashboard
+function enterDashboard(user){
+  currentUser = user;
+  document.getElementById('loginView').classList.add('hidden');
+  document.getElementById('dashboardView').classList.remove('hidden');
+  updateUserUI();
+  renderScripts(DB.get('scripts', []));
+  renderPlans();
+  renderChatHistory();
+  if(user.role === 'admin'){
+    document.getElementById('adminLink').classList.remove('hidden');
+    document.getElementById('adminLink').classList.add('flex');
+  }
+}
+
+// Auto login on load
+window.addEventListener('load', () => {
+  const uid = DB.get('currentUserId');
+  if(uid){
+    const user = DB.get('users', []).find(x => x.id === uid);
+    if(user) enterDashboard(user);
+  }
+});
+
+// ============================================================
+// USER UI
+// ============================================================
 function updateUserUI(){
-  const av = currentUser.avatar || \`https://ui-avatars.com/api/?name=\${encodeURIComponent(currentUser.display_name||currentUser.username)}&background=6366f1&color=fff\`;
+  const av = currentUser.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.display_name||currentUser.username)}&background=6366f1&color=fff&size=128`;
   document.getElementById('sidebarAvatar').src = av;
   document.getElementById('settingsAvatar').src = av;
   document.getElementById('sidebarName').textContent = currentUser.display_name || currentUser.username;
@@ -1038,10 +587,6 @@ function updateUserUI(){
   document.getElementById('setEmail').value = currentUser.email || '';
   document.getElementById('setPhone').value = currentUser.phone || '';
   updatePhoneStatus();
-  if(currentUser.role === 'admin'){
-    document.getElementById('adminLink').classList.remove('hidden');
-    document.getElementById('adminLink').classList.add('flex');
-  }
 }
 
 function updatePhoneStatus(){
@@ -1051,183 +596,248 @@ function updatePhoneStatus(){
   else { el.textContent = '⚠️ Chưa xác minh'; el.className = 'text-xs mt-1 text-orange-400'; }
 }
 
-function setupNav(){
+// User menu
+const userMenuBtn = document.getElementById('userMenuBtn');
+const userMenu = document.getElementById('userMenu');
+const chevron = document.getElementById('chevron');
+userMenuBtn.onclick = e => {
+  e.stopPropagation();
+  userMenu.classList.toggle('hidden');
+  chevron.style.transform = userMenu.classList.contains('hidden') ? '' : 'rotate(180deg)';
+};
+document.addEventListener('click', () => {
+  userMenu.classList.add('hidden');
+  chevron.style.transform = '';
+});
+userMenu.onclick = e => e.stopPropagation();
+
+// ============================================================
+// NAVIGATION
+// ============================================================
+function switchTab(tab){
   const titles = {home:'Trang chủ', shop:'Shop', ai:'AI Chatbot', settings:'Cài đặt', admin:'Cập nhật Script'};
-  document.querySelectorAll('.sidebar-link[data-tab]').forEach(link => {
-    link.onclick = e => {
-      e.preventDefault();
-      const tab = link.dataset.tab;
-      document.querySelectorAll('.sidebar-link').forEach(l => l.classList.remove('active'));
-      link.classList.add('active');
-      document.querySelectorAll('[id^="tab-"]').forEach(s => s.classList.add('hidden'));
-      document.getElementById('tab-'+tab).classList.remove('hidden');
-      document.getElementById('pageTitle').textContent = titles[tab] || tab;
-      if(tab === 'admin') loadAdminScripts();
-      if(tab === 'ai') loadChatHistory();
-    };
-  });
+  document.querySelectorAll('.sidebar-link').forEach(l => l.classList.remove('active'));
+  document.querySelector(`[data-tab="${tab}"]`).classList.add('active');
+  document.querySelectorAll('[id^="tab-"]').forEach(s => s.classList.add('hidden'));
+  document.getElementById('tab-'+tab).classList.remove('hidden');
+  document.getElementById('pageTitle').textContent = titles[tab] || tab;
+  if(tab === 'admin') renderAdminScripts();
+  closeSidebar();
 }
 
-function setupUserMenu(){
-  const btn = document.getElementById('userMenuBtn');
-  const menu = document.getElementById('userMenu');
-  const chev = document.getElementById('chevron');
-  btn.onclick = e => { e.stopPropagation(); menu.classList.toggle('hidden'); chev.style.transform = menu.classList.contains('hidden')?'':'rotate(180deg)'; };
-  document.addEventListener('click', () => { menu.classList.add('hidden'); chev.style.transform=''; });
-  menu.onclick = e => e.stopPropagation();
-  document.getElementById('logoutBtn').onclick = async () => { await fetch('/auth/logout',{method:'POST'}); location.href='/'; };
+function openSidebar(){
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('sidebarOverlay').classList.add('show');
+}
+function closeSidebar(){
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebarOverlay').classList.remove('show');
 }
 
-async function loadScripts(){
-  const r = await fetch('/api/scripts');
-  const d = await r.json();
-  allScripts = d.scripts;
-  renderScripts(allScripts);
-}
+// ============================================================
+// SCRIPTS
+// ============================================================
+let allScripts = [];
 
 function renderScripts(scripts){
+  allScripts = scripts;
   const list = document.getElementById('scriptsList');
-  if(!scripts.length){ list.innerHTML = '<p class="col-span-full text-center text-gray-500 py-10">Chưa có script nào.</p>'; return; }
-  list.innerHTML = scripts.map(s => \`
-    <div class="card-3d" onclick="viewScript(\${s.id})">
-      <div class="card-3d-inner glass glass-hover rounded-2xl p-5 cursor-pointer h-full transition">
-        <div class="flex items-start justify-between mb-3">
-          <h3 class="font-bold text-white flex-1">\${escapeHtml(s.title)}</h3>
-          <span class="text-xs px-2 py-1 bg-violet-500/20 text-violet-300 rounded-full font-medium border border-violet-500/30">\${escapeHtml(s.category)}</span>
-        </div>
-        <p class="text-sm text-gray-400 line-clamp-2 mb-4">\${escapeHtml(s.description||'Không có mô tả')}</p>
-        <div class="flex items-center justify-between text-xs text-gray-500 pt-3 border-t border-violet-500/10">
-          <span>👤 \${escapeHtml(s.author_display||s.author_name||'Unknown')}</span>
-          <span>\${new Date(s.created_at).toLocaleDateString('vi-VN')}</span>
-        </div>
+  if(!scripts.length){
+    list.innerHTML = '<p class="col-span-full text-center text-gray-500 py-10">Chưa có script nào.</p>';
+    return;
+  }
+  list.innerHTML = scripts.slice().sort((a,b) => new Date(b.created_at) - new Date(a.created_at)).map(s => `
+    <div class="glass glass-hover rounded-2xl p-5 cursor-pointer transition" onclick="viewScript(${s.id})">
+      <div class="flex items-start justify-between mb-3">
+        <h3 class="font-bold text-white flex-1 pr-2">${escapeHtml(s.title)}</h3>
+        <span class="text-xs px-2 py-1 bg-violet-500/20 text-violet-300 rounded-full font-medium border border-violet-500/30 whitespace-nowrap">${escapeHtml(s.category)}</span>
+      </div>
+      <p class="text-sm text-gray-400 mb-4 line-clamp-2">${escapeHtml(s.description||'Không có mô tả')}</p>
+      <div class="flex items-center justify-between text-xs text-gray-500 pt-3 border-t border-violet-500/10">
+        <span>👤 ${escapeHtml(s.author_display||'Unknown')}</span>
+        <span>${new Date(s.created_at).toLocaleDateString('vi-VN')}</span>
       </div>
     </div>
-  \`).join('');
-  initCard3D();
+  `).join('');
 }
 
-window.viewScript = id => {
+function viewScript(id){
   const s = allScripts.find(x => x.id === id);
   if(!s) return;
   document.getElementById('viewTitle').textContent = s.title;
   document.getElementById('viewDesc').textContent = s.description || 'Không có mô tả';
   document.getElementById('viewCode').textContent = s.code;
   document.getElementById('viewModal').classList.remove('hidden');
-  document.getElementById('copyCodeBtn').onclick = () => { navigator.clipboard.writeText(s.code); toast('✅ Đã copy!'); };
-};
-
-function setupModal(){
-  document.getElementById('viewModal').onclick = e => { if(e.target.id === 'viewModal') e.target.classList.add('hidden'); };
-}
-
-function setupSearch(){
-  document.getElementById('searchScript').oninput = e => {
-    const q = e.target.value.toLowerCase();
-    renderScripts(allScripts.filter(s => s.title.toLowerCase().includes(q) || (s.description||'').toLowerCase().includes(q) || s.category.toLowerCase().includes(q)));
+  document.getElementById('copyCodeBtn').onclick = () => {
+    navigator.clipboard.writeText(s.code).then(() => toast('✅ Đã copy code!'));
   };
 }
 
-async function loadPlans(){
-  const r = await fetch('/api/shop/plans');
-  const d = await r.json();
+document.getElementById('searchScript').oninput = e => {
+  const q = e.target.value.toLowerCase();
+  renderScripts(DB.get('scripts', []).filter(s =>
+    s.title.toLowerCase().includes(q) ||
+    (s.description||'').toLowerCase().includes(q) ||
+    s.category.toLowerCase().includes(q)
+  ));
+};
+
+// ============================================================
+// SHOP
+// ============================================================
+const PLANS = {
+  free: { name: 'Free', price: 0, features: ['Truy cập script cơ bản', 'Chat AI giới hạn'] },
+  pro: { name: 'Pro', price: 99000, features: ['Tất cả script Pro', 'Chat AI không giới hạn', 'Hỗ trợ ưu tiên'] },
+  premium: { name: 'Premium', price: 199000, features: ['Tất cả script Premium', 'Chat AI VIP', 'Hỗ trợ 24/7', 'Yêu cầu script riêng'] }
+};
+
+function renderPlans(){
   const list = document.getElementById('plansList');
-  list.innerHTML = Object.entries(d.plans).map(([key, plan]) => {
+  list.innerHTML = Object.entries(PLANS).map(([key, plan]) => {
     const isCur = currentUser.plan === key;
     const color = key === 'premium' ? 'from-yellow-400 to-orange-500' : key === 'pro' ? 'from-violet-500 to-pink-500' : 'from-gray-500 to-gray-600';
-    return \`
-      <div class="plan-card glass rounded-2xl p-6 \${isCur?'ring-2 ring-violet-500':''}">
-        <div class="bg-gradient-to-r \${color} text-white text-center py-3 rounded-lg font-bold mb-4 shadow-lg">\${plan.name}</div>
-        <p class="text-3xl font-bold text-center mb-4 text-white">\${plan.price === 0 ? 'Miễn phí' : plan.price.toLocaleString('vi-VN')+'đ'}</p>
+    return `
+      <div class="plan-card glass rounded-2xl p-6 ${isCur?'ring-2 ring-violet-500':''}">
+        <div class="bg-gradient-to-r ${color} text-white text-center py-3 rounded-lg font-bold mb-4 shadow-lg">${plan.name}</div>
+        <p class="text-3xl font-bold text-center mb-4 text-white">${plan.price === 0 ? 'Miễn phí' : plan.price.toLocaleString('vi-VN')+'đ'}</p>
         <ul class="space-y-2 mb-6 text-sm">
-          \${plan.features.map(f => \`<li class="flex items-start gap-2 text-gray-300"><span class="text-green-400">✓</span> <span>\${escapeHtml(f)}</span></li>\`).join('')}
+          ${plan.features.map(f => `<li class="flex items-start gap-2 text-gray-300"><span class="text-green-400">✓</span> <span>${escapeHtml(f)}</span></li>`).join('')}
         </ul>
-        \${isCur 
+        ${isCur 
           ? '<button disabled class="w-full py-2.5 bg-gray-700 rounded-lg font-medium text-gray-400">Đang dùng</button>'
           : key === 'free'
             ? '<button disabled class="w-full py-2.5 bg-gray-700 rounded-lg font-medium text-gray-400">Mặc định</button>'
-            : \`<button onclick="buyPlan('\${key}')" class="neon-btn w-full py-2.5 text-white rounded-lg font-semibold">Mua ngay</button>\`
+            : `<button onclick="buyPlan('${key}')" class="neon-btn w-full py-2.5 text-white rounded-lg font-semibold">Mua ngay</button>`
         }
       </div>
-    \`;
+    `;
   }).join('');
 }
 
-window.buyPlan = async plan => {
-  if(!confirm(\`Mua gói \${plan.toUpperCase()}?\`)) return;
-  const r = await fetch('/api/shop/buy', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({plan})});
-  const d = await r.json();
-  if(d.success){
-    toast('🎉 Mua thành công!');
-    const mr = await fetch('/api/me');
-    currentUser = (await mr.json()).user;
+function buyPlan(plan){
+  if(!confirm(`Mua gói ${plan.toUpperCase()}?`)) return;
+  const users = DB.get('users', []);
+  const idx = users.findIndex(u => u.id === currentUser.id);
+  if(idx === -1) return;
+  users[idx].plan = plan;
+  DB.set('users', users);
+  currentUser = users[idx];
+  updateUserUI();
+  renderPlans();
+  toast('🎉 Mua thành công!');
+}
+
+// ============================================================
+// SETTINGS
+// ============================================================
+function saveProfile(){
+  const users = DB.get('users', []);
+  const idx = users.findIndex(u => u.id === currentUser.id);
+  if(idx === -1) return;
+  const newPhone = document.getElementById('setPhone').value.trim();
+  users[idx].display_name = document.getElementById('setDisplayName').value.trim();
+  users[idx].email = document.getElementById('setEmail').value.trim();
+  if(newPhone !== users[idx].phone){
+    users[idx].phone = newPhone;
+    users[idx].phone_verified = false;
+  }
+  DB.set('users', users);
+  currentUser = users[idx];
+  updateUserUI();
+  toast('✅ Đã lưu!');
+}
+
+function sendOTP(){
+  const phone = document.getElementById('setPhone').value.trim();
+  if(!/^[0-9+\-\s]{8,15}$/.test(phone)){ toast('❌ SĐT không hợp lệ'); return; }
+  document.getElementById('otpBox').classList.remove('hidden');
+  toast('📱 OTP demo: 123456');
+}
+
+function verifyOTP(){
+  const otp = document.getElementById('otpInput').value.trim();
+  if(otp !== '123456'){ toast('❌ OTP sai (thử 123456)'); return; }
+  const users = DB.get('users', []);
+  const idx = users.findIndex(u => u.id === currentUser.id);
+  users[idx].phone_verified = true;
+  DB.set('users', users);
+  currentUser = users[idx];
+  updateUserUI();
+  document.getElementById('otpBox').classList.add('hidden');
+  toast('✅ Xác minh SĐT thành công!');
+}
+
+document.getElementById('avatarInput').onchange = e => {
+  const f = e.target.files[0];
+  if(!f) return;
+  if(f.size > 2 * 1024 * 1024){ toast('❌ Ảnh <= 2MB'); return; }
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const users = DB.get('users', []);
+    const idx = users.findIndex(u => u.id === currentUser.id);
+    users[idx].avatar = ev.target.result;
+    DB.set('users', users);
+    currentUser = users[idx];
     updateUserUI();
-    loadPlans();
-  } else toast('❌ '+(d.error||'Lỗi'));
+    toast('✅ Đã cập nhật avatar!');
+  };
+  reader.readAsDataURL(f);
 };
 
-function setupSettings(){
-  document.getElementById('settingsForm').onsubmit = async e => {
-    e.preventDefault();
-    const r = await fetch('/api/user/profile', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
-      display_name: document.getElementById('setDisplayName').value,
-      email: document.getElementById('setEmail').value,
-      phone: document.getElementById('setPhone').value
-    })});
-    const d = await r.json();
-    if(d.success){ currentUser = d.user; updateUserUI(); toast('✅ Đã lưu!'); }
-    else toast('❌ '+(d.error||'Lỗi'));
-  };
-
-  document.getElementById('sendOtpBtn').onclick = async () => {
-    const r = await fetch('/api/user/phone/send-otp', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({phone: document.getElementById('setPhone').value})});
-    const d = await r.json();
-    if(d.success){ document.getElementById('otpBox').classList.remove('hidden'); toast(\`📱 OTP: \${d.dev_otp}\`); }
-    else toast('❌ '+(d.error||'Lỗi'));
-  };
-
-  document.getElementById('verifyOtpBtn').onclick = async () => {
-    const r = await fetch('/api/user/phone/verify', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({otp: document.getElementById('otpInput').value})});
-    const d = await r.json();
-    if(d.success){
-      toast('✅ Xác minh SĐT!');
-      const mr = await fetch('/api/me');
-      currentUser = (await mr.json()).user;
-      updateUserUI();
-      document.getElementById('otpBox').classList.add('hidden');
-    } else toast('❌ '+(d.error||'Lỗi'));
-  };
-
-  document.getElementById('avatarInput').onchange = async e => {
-    const f = e.target.files[0]; if(!f) return;
-    const fd = new FormData(); fd.append('avatar', f);
-    const r = await fetch('/api/user/avatar', {method:'POST', body: fd});
-    const d = await r.json();
-    if(d.success){ currentUser.avatar = d.avatar+'?t='+Date.now(); updateUserUI(); toast('✅ Đã cập nhật avatar!'); }
-    else toast('❌ '+(d.error||'Lỗi'));
-  };
-}
-
-// ===== AI CHAT =====
-function loadChatHistory(){
-  if(chatInitialized) return;
-  chatInitialized = true;
-  fetch('/api/ai/history').then(r=>r.json()).then(d => {
-    if(d.history?.length) d.history.forEach(m => appendMessage(m.role, m.message));
-    else appendMessage('assistant', '👋 Xin chào! Tôi là AI của LuaShare. Hỏi tôi về Lua, script, hoặc bất cứ điều gì!');
-  });
-}
-
-function appendMessage(role, text){
+// ============================================================
+// AI CHATBOT
+// ============================================================
+function renderChatHistory(){
+  const chat = DB.get('chat', []);
   const box = document.getElementById('chatMessages');
-  const isUser = role === 'user';
-  const div = document.createElement('div');
-  div.className = 'flex '+(isUser?'justify-end':'justify-start')+' chat-msg';
-  div.innerHTML = \`<div class="max-w-[80%] px-4 py-2.5 rounded-2xl \${isUser?'bg-gradient-to-r from-violet-600 to-pink-600 text-white rounded-br-sm':'glass text-gray-200 rounded-bl-sm'} whitespace-pre-wrap">\${escapeHtml(text)}</div>\`;
-  box.appendChild(div);
+  box.innerHTML = '';
+  if(!chat.length){
+    appendMessage('assistant', '👋 Xin chào! Tôi là AI của LuaShare. Hỏi tôi về Lua, script, gói Pro/Premium, hoặc bất cứ điều gì!');
+  } else {
+    chat.forEach(m => appendMessage(m.role, m.text, false));
+  }
   box.scrollTop = box.scrollHeight;
 }
 
-document.getElementById('chatForm')?.addEventListener('submit', async e => {
+function appendMessage(role, text, save = true){
+  const box = document.getElementById('chatMessages');
+  const isUser = role === 'user';
+  const div = document.createElement('div');
+  div.className = 'flex ' + (isUser ? 'justify-end' : 'justify-start') + ' chat-msg';
+  div.innerHTML = `<div class="max-w-[80%] px-4 py-2.5 rounded-2xl ${isUser?'bg-gradient-to-r from-violet-600 to-pink-600 text-white rounded-br-sm':'glass text-gray-200 rounded-bl-sm'} whitespace-pre-wrap text-sm">${escapeHtml(text)}</div>`;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  if(save){
+    const chat = DB.get('chat', []);
+    chat.push({role, text, at: Date.now()});
+    DB.set('chat', chat.slice(-100));
+  }
+}
+
+function aiReply(msg){
+  const m = msg.toLowerCase();
+  if(m.includes('xin chào') || m.includes('hello') || m.includes('hi ') || m === 'hi')
+    return '👋 Xin chào! Tôi là trợ lý AI của LuaShare. Hỏi tôi về Lua, script, hoặc gói nâng cấp nhé!';
+  if(m.includes('lua') || m.includes('script'))
+    return '📚 Về Lua Script:\n\nLua là ngôn ngữ scripting nhẹ, phổ biến trong game (Roblox, FiveM).\n\nVí dụ:\n```lua\nlocal x = 10\nif x > 5 then\n  print("Lớn hơn 5")\nend\n```';
+  if(m.includes('roblox'))
+    return '🎮 Roblox dùng Luau (Lua). Bạn có thể tạo game, script, UI trên Roblox Studio!';
+  if(m.includes('pro') || m.includes('premium') || m.includes('mua'))
+    return '💎 Gói nâng cấp:\n\n• Pro (99.000đ): script Pro, AI không giới hạn\n• Premium (199.000đ): tất cả + hỗ trợ 24/7\n\nVào tab Shop để mua nhé!';
+  if(m.includes('discord'))
+    return '💬 Vào server Discord qua tab "Discord Server" ở sidebar nhé!';
+  if(m.includes('cảm ơn') || m.includes('thank'))
+    return '😊 Rất vui được giúp bạn! Hỏi tôi gì thêm nhé.';
+  if(m.includes('admin'))
+    return '👑 Admin mặc định: username "huypham", password "huypham".';
+  if(m.includes('đăng nhập') || m.includes('login'))
+    return '🔑 Bạn có thể đăng nhập bằng:\n1. Tài khoản admin: huypham / huypham\n2. Tự đăng ký tài khoản mới ở tab "Đăng ký"\n3. Nút "Đăng nhập bằng Google (demo)"';
+  if(m.includes('?') || m.includes('gì') || m.includes('sao') || m.includes('như thế nào'))
+    return `🤔 Câu hỏi hay! Về "${msg}":\n\nĐây là AI demo chạy offline. Bạn có thể hỏi tôi về:\n• Lua / Roblox / script\n• Gói Pro / Premium\n• Đăng nhập / tài khoản\n• Discord server`;
+  return `💡 Bạn hỏi: "${msg}"\n\nTôi là AI demo. Thử hỏi về: Lua, script, Roblox, gói Pro/Premium, đăng nhập... nhé!`;
+}
+
+document.getElementById('chatForm').onsubmit = e => {
   e.preventDefault();
   const input = document.getElementById('chatInput');
   const msg = input.value.trim();
@@ -1239,56 +849,93 @@ document.getElementById('chatForm')?.addEventListener('submit', async e => {
   const typing = document.createElement('div');
   typing.id = 'typing';
   typing.className = 'flex justify-start';
-  typing.innerHTML = '<div class="glass px-4 py-2.5 rounded-2xl rounded-bl-sm text-gray-400"><span class="animate-pulse">Đang trả lời...</span></div>';
+  typing.innerHTML = '<div class="glass px-4 py-2.5 rounded-2xl rounded-bl-sm text-gray-400 text-sm"><span class="animate-pulse">Đang trả lời...</span></div>';
   box.appendChild(typing);
   box.scrollTop = box.scrollHeight;
-
-  try {
-    const r = await fetch('/api/ai/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message: msg})});
-    const d = await r.json();
+  
+  setTimeout(() => {
     document.getElementById('typing')?.remove();
-    appendMessage('assistant', d.reply || 'Lỗi.');
-  } catch { document.getElementById('typing')?.remove(); appendMessage('assistant', '❌ Lỗi kết nối.'); }
-});
+    appendMessage('assistant', aiReply(msg));
+  }, 500 + Math.random() * 500);
+};
 
-// ===== ADMIN =====
-async function loadAdminScripts(){
-  const r = await fetch('/api/scripts');
-  const d = await r.json();
+// ============================================================
+// ADMIN
+// ============================================================
+function renderAdminScripts(){
+  const scripts = DB.get('scripts', []).slice().sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
   const list = document.getElementById('adminScriptsList');
-  if(!d.scripts.length){ list.innerHTML = '<p class="text-gray-500 text-center py-4">Chưa có script.</p>'; return; }
-  list.innerHTML = d.scripts.map(s => \`
+  if(!scripts.length){
+    list.innerHTML = '<p class="text-gray-500 text-center py-4">Chưa có script.</p>';
+    return;
+  }
+  list.innerHTML = scripts.map(s => `
     <div class="flex items-center gap-2 p-3 bg-black/30 border border-violet-500/20 rounded-lg">
       <div class="flex-1 min-w-0">
-        <p class="font-medium text-sm truncate text-white">\${escapeHtml(s.title)}</p>
-        <p class="text-xs text-gray-500">\${escapeHtml(s.category)} • \${new Date(s.created_at).toLocaleDateString('vi-VN')}</p>
+        <p class="font-medium text-sm truncate text-white">${escapeHtml(s.title)}</p>
+        <p class="text-xs text-gray-500">${escapeHtml(s.category)} • ${new Date(s.created_at).toLocaleDateString('vi-VN')}</p>
       </div>
-      <button onclick="editScript(\${s.id})" class="px-3 py-1 bg-blue-500/20 text-blue-300 border border-blue-500/40 rounded text-xs font-medium hover:bg-blue-500/30">Sửa</button>
-      <button onclick="deleteScript(\${s.id})" class="px-3 py-1 bg-red-500/20 text-red-300 border border-red-500/40 rounded text-xs font-medium hover:bg-red-500/30">Xóa</button>
+      <button onclick="editScript(${s.id})" class="px-3 py-1 bg-blue-500/20 text-blue-300 border border-blue-500/40 rounded text-xs font-medium hover:bg-blue-500/30">Sửa</button>
+      <button onclick="deleteScript(${s.id})" class="px-3 py-1 bg-red-500/20 text-red-300 border border-red-500/40 rounded text-xs font-medium hover:bg-red-500/30">Xóa</button>
     </div>
-  \`).join('');
+  `).join('');
 }
 
-document.getElementById('scriptForm')?.addEventListener('submit', async e => {
+document.getElementById('scriptForm').onsubmit = e => {
   e.preventDefault();
   const id = document.getElementById('scriptId').value;
-  const body = {
-    title: document.getElementById('scriptTitle').value,
-    description: document.getElementById('scriptDesc').value,
-    category: document.getElementById('scriptCategory').value || 'General',
+  const data = {
+    title: document.getElementById('scriptTitle').value.trim(),
+    description: document.getElementById('scriptDesc').value.trim(),
+    category: document.getElementById('scriptCategory').value.trim() || 'General',
     code: document.getElementById('scriptCode').value
   };
-  const r = await fetch(id ? '/api/scripts/'+id : '/api/scripts', {
-    method: id ? 'PUT' : 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(body)
-  });
-  const d = await r.json();
-  if(d.success){ toast(id?'✅ Đã cập nhật!':'✅ Đã thêm!'); resetScriptForm(); loadAdminScripts(); loadScripts(); }
-  else toast('❌ '+(d.error||'Lỗi'));
-});
+  const scripts = DB.get('scripts', []);
+  
+  if(id){
+    const idx = scripts.findIndex(s => s.id == id);
+    if(idx !== -1){
+      scripts[idx] = {...scripts[idx], ...data, updated_at: new Date().toISOString()};
+      toast('✅ Đã cập nhật script!');
+    }
+  } else {
+    scripts.push({
+      id: Date.now(),
+      ...data,
+      author_id: currentUser.id,
+      author_display: currentUser.display_name || currentUser.username,
+      created_at: new Date().toISOString()
+    });
+    toast('✅ Đã thêm script!');
+  }
+  
+  DB.set('scripts', scripts);
+  resetScriptForm();
+  renderAdminScripts();
+  renderScripts(scripts);
+};
 
-document.getElementById('resetFormBtn')?.addEventListener('click', resetScriptForm);
+function editScript(id){
+  const s = DB.get('scripts', []).find(x => x.id === id);
+  if(!s) return;
+  document.getElementById('scriptId').value = s.id;
+  document.getElementById('scriptTitle').value = s.title;
+  document.getElementById('scriptDesc').value = s.description || '';
+  document.getElementById('scriptCategory').value = s.category;
+  document.getElementById('scriptCode').value = s.code;
+  document.getElementById('formTitle').textContent = '✏️ Chỉnh sửa Script';
+  switchTab('admin');
+  window.scrollTo(0,0);
+}
+
+function deleteScript(id){
+  if(!confirm('Xóa script này?')) return;
+  const scripts = DB.get('scripts', []).filter(s => s.id !== id);
+  DB.set('scripts', scripts);
+  renderAdminScripts();
+  renderScripts(scripts);
+  toast('🗑️ Đã xóa!');
+}
 
 function resetScriptForm(){
   document.getElementById('scriptForm').reset();
@@ -1296,30 +943,13 @@ function resetScriptForm(){
   document.getElementById('formTitle').textContent = '➕ Thêm Script mới';
 }
 
-window.editScript = async id => {
-  const r = await fetch('/api/scripts/'+id);
-  const d = await r.json();
-  if(!d.script) return;
-  const s = d.script;
-  document.getElementById('scriptId').value = s.id;
-  document.getElementById('scriptTitle').value = s.title;
-  document.getElementById('scriptDesc').value = s.description || '';
-  document.getElementById('scriptCategory').value = s.category;
-  document.getElementById('scriptCode').value = s.code;
-  document.getElementById('formTitle').textContent = '✏️ Chỉnh sửa Script';
-  document.querySelector('[data-tab="admin"]').click();
-};
-
-window.deleteScript = async id => {
-  if(!confirm('Xóa script này?')) return;
-  const r = await fetch('/api/scripts/'+id, {method:'DELETE'});
-  const d = await r.json();
-  if(d.success){ toast('🗑️ Đã xóa!'); loadAdminScripts(); loadScripts(); }
-  else toast('❌ '+(d.error||'Lỗi'));
-};
-
-// ===== UTILS =====
-function escapeHtml(s){ if(!s) return ''; return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+// ============================================================
+// UTILS
+// ============================================================
+function escapeHtml(s){
+  if(!s) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
 function toast(msg){
   const t = document.getElementById('toast');
@@ -1329,16 +959,8 @@ function toast(msg){
   t._tm = setTimeout(() => t.classList.add('hidden'), 2500);
 }
 
-init();
+console.log('%c🚀 LuaShare 3D', 'color:#8b5cf6;font-size:20px;font-weight:bold');
+console.log('%cAdmin: huypham / huypham', 'color:#ec4899;font-size:14px');
 </script>
 </body>
-</html>`;
-
-// ============================================================
-// START SERVER
-// ============================================================
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`\n🚀 LuaShare 3D đang chạy: http://localhost:${PORT}`);
-  console.log(`👑 Admin: huypham / huypham\n`);
-});
+</html>
